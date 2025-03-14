@@ -1,302 +1,279 @@
-use csv::StringRecord;
-use slug::slugify;
-use std::env;
-use std::error::Error;
-use std::fmt;
-use std::fmt::Display;
-use std::io::{self, Write};
-use std::str::FromStr;
+use anyhow::{Context, Result};
+use clap::{self, Parser};
+use clap_repl::reedline::{DefaultPrompt, DefaultPromptSegment, Reedline};
+use clap_repl::ClapEditor;
+use serde_cbor::{from_slice, to_vec};
+use serde_derive::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::io;
+use std::io::{Read, Write};
+use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
+use std::sync::mpsc::{channel, Receiver};
+use std::sync::{Arc, RwLock};
 use std::thread;
-use std::sync::{Arc};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Receiver, Sender, channel};
-use std::fs;
 
-#[derive(Debug)]
-#[derive(Default)]
-enum Operation {
-     #[default]
-    NoOp,
-    Lowercase,
-    Uppercase,
-    NoSpaces,
-    Slugify,
-    Csv,
-   }
+#[derive(Serialize, Deserialize, Debug, Clone)]
+enum MessageType {
+    Text(String),
+    Image(Vec<u8>),
+    File { name: String, data: Vec<u8> },
+}
 
-impl FromStr for Operation {
-    type Err = Box<dyn Error>;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "lowercase" => Ok(Operation::Lowercase),
-            "uppercase" => Ok(Operation::Uppercase),
-            "no-spaces" => Ok(Operation::NoSpaces),
-            "slugify" => Ok(Operation::Slugify),
-            "csv" => Ok(Operation::Csv),
-            "noop" => Ok(Operation::NoOp),
-            _ => Err("Invalid option".into()),
-        }
+impl MessageType {
+    fn serialize_cbor(&self) -> Result<Vec<u8>> {
+        Ok(to_vec(&self)?)
     }
-}
 
-struct InputData {
-    op: Operation,
-    data: String,
-}
+    fn deserialize_cbor(data: &[u8]) -> Result<Self> {
+        Ok(from_slice(data)?)
+    }
 
-struct CsvRecord {
-    header: Vec<String>,
-    data: Vec<StringRecord>,
-}
-
-impl CsvRecord {
-    fn write_row(&self, f: &mut fmt::Formatter) -> Result<(), std::fmt::Error> {
-        for _i in 0..self.header.len() {
-            write!(f, "+{:-<16}", "")?;
-        }
-        write!(f, "+\n")?;
+    fn send_messages(&self, stream: &mut TcpStream) -> Result<()> {
+        let data = self.serialize_cbor()?;
+        let len = data.len() as u32;
+        stream.write_all(&len.to_be_bytes())?;
+        stream.write_all(&data)?;
         Ok(())
     }
-}
 
-impl Display for CsvRecord {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        self.write_row(f)?;
-        for header in self.header.iter() {
-            write!(f, "|{:^16}", header)?;
-        }
-        write!(f, "|\n")?;
-        self.write_row(f)?;
-        for record in self.data.iter() {
-            for field in record.iter() {
-                write!(f, "|{:^16}", field)?;
-            }
-            write!(f, "|\n")?;
-            self.write_row(f)?;
-        }
-        Ok(())
-    }
-}
- 
-
-fn usage() {
-    println!("Usage: helloworld [lowercase, uppercase, no-spaces, slugify, csv] <input>");
-}
-
-fn lowercase_me(input: &String) -> Result<String, Box<dyn Error>> {
-    if input.is_empty() {
-        return Err("Empty input".into());
-    }
-    Ok(input.to_lowercase())
-}
-
-fn uppercase_me(input: &String) -> Result<String, Box<dyn Error>> {
-    if input.is_empty() {
-        return Err("Empty input".into());
-    }
-    Ok(input.to_uppercase())
-}
-
-fn no_spaces_me(input: &String) -> Result<String, Box<dyn Error>> {
-    if input.is_empty() {
-        return Err("Empty input".into());
-    }
-    Ok(input.replace(" ", ""))
-}
-
-fn slugify_me(input: &String) -> Result<String, Box<dyn Error>> {
-    if input.is_empty() {
-        return Err("Empty input".into());
-    }
-    Ok(slugify(input))
-}
-
-fn cvs_me() -> Result<String, Box<dyn Error>> {
-    let mut csv_records = CsvRecord {
-        header: Vec::new(),
-        data: Vec::new(),
-    };
-    let mut cvs_data = csv::Reader::from_reader(std::io::stdin());
-    let headers = cvs_data.headers()?;
-    for header in headers {
-        csv_records.header.push(header.to_string());
-    }
-    for result in cvs_data.records() {
-        let record = result;
-        match record {
-            Ok(record) => {
-                csv_records.data.push(record);
-            }
-            Err(e) => eprintln!("Error: {}", e.to_string()),
-        }
-    }
-    println!("{}", csv_records);
-    Ok("".to_string())
-}
-
-
-fn parse_input_data(raw_data: &String) -> Result<InputData, Box<dyn Error>> {
-    let Some(cmddata) = raw_data.trim().split_once(" ") else {
-        return Err("Invalid input".into());
-    };
-    let input = InputData {
-        op:  Operation::from_str(cmddata.0)?,
-        data: cmddata.1.to_string(),
-    };
-    Ok(input)
-}
-
-
-fn process_input(input: InputData) -> Result<String, Box<dyn Error>> {
-    let result: Result<String, Box<dyn Error>>;
-    let InputData { op, data } = input;
-
-      result = match op {
-        Operation::Lowercase => {
-            lowercase_me(&data)
-        },
-        Operation::Uppercase => {
-            uppercase_me(&data)
-        },
-        Operation::NoSpaces => {
-            no_spaces_me(&data)
-        },
-        Operation::Slugify => {
-            slugify_me(&data)
-        },
-        Operation::Csv => cvs_me(),
-        Operation::NoOp => {
-            Ok("NO OP".to_string())
-        },
-    };
-
-    match result {
-        Ok(result) => Ok(result),
-        Err(e) => Err(e),
+    fn read_message(stream: &mut TcpStream) -> Result<Self> {
+        let mut len = [0u8; 4];
+        stream.read_exact(&mut len)?;
+        let len = u32::from_be_bytes(len) as usize;
+        let mut data = vec![0u8; len];
+        stream.read_exact(&mut data)?;
+        let message = Self::deserialize_cbor(&data)?;
+        Ok(message)
     }
 }
 
-
-fn one_shot_cmd(op: &str, text: String) -> Result<(), Box<dyn Error>> {
-     let input_data = InputData{
-        op: Operation::from_str(op)?,
-        data: text,
-    };
-    let result = process_input(input_data);
-    match result {
-        Ok(result) => {
-            println!("Result: {}", result);
-        },
-        Err(e) => {
-            eprintln!("Error: {}", e);
-        },
-    }
-    Ok(())
-}
-
-
-fn reader_thr(txch: Sender<String>) {
-    let mut input = String::new();  
-    let tx = txch.clone();
+fn srv_handle(stream: &mut TcpStream, clients: &Arc<RwLock<HashMap<SocketAddr, TcpStream>>>) {
     loop {
-        let _ = io::stdin().read_line(&mut input);
-        println!("Received: {}", input);
-        let h = tx.send(input.clone());
-        if h.is_err() {
-            eprintln!("Error: {}", h.err().unwrap());
-            break;
+        let Ok(addr) = stream.peer_addr() else {
+            eprintln!(" no address");
+            continue;
+        };
+        let message = MessageType::read_message(stream);
+        match &message {
+            Ok(MessageType::Text(text)) => {
+                println!("text: {}", text);
+            }
+            Ok(MessageType::Image(data)) => {
+                println!("image: {} bytes", data.len());
+            }
+            Ok(MessageType::File { name, data }) => {
+                println!("file: {} bytes", data.len());
+                std::fs::write(name, data).unwrap();
+            }
+            Err(e) => {
+                eprintln!("unable read from stream {:?}", e);
+                let _ = stream.shutdown(Shutdown::Both);
+                break;
+            }
         }
-        input.clear();
+
+        for client in clients.write().unwrap().values_mut() {
+            let Ok(cl_addr) = client.peer_addr() else {
+                continue;
+            };
+            if addr == cl_addr {
+                continue;
+            };
+            match &message {
+                Ok(m) => {
+                    let resp = m.send_messages(client);
+                    match resp {
+                        Ok(_) => {}
+                        Err(ref e)
+                            if e.downcast_ref::<std::io::Error>().unwrap().kind()
+                                == io::ErrorKind::UnexpectedEof =>
+                        {
+                            eprintln!("End of file before the filing buffer");
+                            clients.write().unwrap().remove(&cl_addr);
+                            let _ = client.shutdown(Shutdown::Both);
+                            continue;
+                        }
+                        Err(e) => {
+                            eprintln!("send message {e}");
+                            let _ = client.shutdown(Shutdown::Both);
+                            break;
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("unable write to stream {:?}", e);
+                    let _ = client.shutdown(Shutdown::Both);
+                    break;
+                    //Err(anyhow::anyhow!("Client is closed"))
+                }
+            };
+        }
     }
 }
 
-fn read_cvs_file(file: &str) -> Result<(), Box<dyn Error>> {
-    let mut csv_records = CsvRecord {
-        header: Vec::new(),
-        data: Vec::new(),
-    };
-    let file_rec: String  = fs::read_to_string(file)?;
-    let mut cvs_data = csv::Reader::from_reader(file_rec.as_bytes());
-    let headers = cvs_data.headers()?;
-    for header in headers {
-        csv_records.header.push(header.to_string());
-    }
-    for result in cvs_data.records() {
-        let record = result;
-        match record {
-            Ok(record) => {
-                csv_records.data.push(record);
-            }
-            Err(e) => eprintln!("Error: {}", e.to_string()),
+fn server(host: &str, port: u16) -> Result<()> {
+    let tcp_listener = TcpListener::bind((host, port))?;
+    let clients: HashMap<SocketAddr, TcpStream> = HashMap::new();
+    let rc_client = Arc::new(RwLock::new(clients));
+    let clients_cloned = rc_client.clone();
+
+    for stream in tcp_listener.incoming() {
+        let Ok(stream) = stream else {
+            eprintln!("failed: get stream");
+            continue;
+        };
+        let Ok(addr) = stream.peer_addr() else {
+            eprintln!("failed: get port");
+            continue;
+        };
+        println!("new client: {:?}", addr);
+        {
+            let cl = clients_cloned.clone();
+            cl.write()
+                .unwrap()
+                .insert(addr, stream.try_clone().unwrap());
         }
+        let cl_cl = clients_cloned.clone();
+        let _srv_handle = thread::Builder::new()
+            .name("server".to_owned())
+            .spawn(move || {
+                srv_handle(&mut stream.try_clone().unwrap(), &cl_cl);
+            });
     }
-    println!("{}", csv_records);
     Ok(())
 }
 
+fn client(rxch: Receiver<MessageType>, host: &str, port: u16) -> Result<()> {
+    let stream = TcpStream::connect((host, port))?;
+    let mut reader = stream.try_clone()?;
+    let mut writer = stream.try_clone()?;
 
+    let _reader_thread = thread::spawn(move || -> Result<()> {
+        loop {
+            let response = MessageType::read_message(&mut reader)?;
+            match response {
+                MessageType::Text(text) => println!("\n\rReceive text: {}", text),
+                MessageType::Image(data) => {
+                    std::fs::create_dir_all("images")?;
+                    println!("Receiving image ....");
+                    let now = chrono::Local::now();
+                    let fmt_date = now.format("%Y-%m-%d-%H-%M-%S").to_string();
+                    std::fs::write(format!("images/{fmt_date}.png"), data)?;
+                }
+                MessageType::File { name, data } => {
+                    println!("Receiving file ....");
+                    std::fs::create_dir_all("files")?;
+                    std::fs::write(format!("files/{name}"), data)?;
+                }
+            }
+        }
+    });
 
-fn process_thr(rxch: Receiver<String>, run: &AtomicBool) {
-    while run.load(Ordering::Relaxed) {
-        print!("Waiting for input:>");
-        io::stdout().flush().unwrap();
-
-        let raw_input = rxch.recv();
-        if raw_input.is_err() {
-            eprintln!("Error: {}", raw_input.err().unwrap());
-            continue;
+    let _writer_thread = thread::spawn(move || -> Result<()> {
+        loop {
+            let message = rxch.recv()?;
+            message.send_messages(&mut writer)?;
         }
-        let input_data = parse_input_data(&raw_input.unwrap());
-        if input_data.is_err() {
-            eprintln!("Error: {}", input_data.err().unwrap());
-            continue;
-        }
-        let result = process_input(input_data.unwrap());
-        match result {
-            Ok(result) => {
-                println!("Result: {}", result);
-            },
-            Err(e) => {
-                eprintln!("Error: {}", e);
-            },
-        }
-    }
+    });
+    Ok(())
 }
 
+#[derive(Parser, Debug)]
+#[command(version = "0.0.1", author = "Marek N", about = "lesson 09 home work", long_about = None)]
+struct CliArgs {
+    #[arg(short, long, default_value = "localhost")]
+    address: String,
+    #[arg(short, long, default_value = "11111")]
+    port: u16,
+    #[arg(short, long, default_value = "server")]
+    mode: String,
+}
 
+#[derive(Debug, Parser)]
+#[command(name = "")]
+enum Commands {
+    #[command(about = "send file")]
+    Filename { path: String },
+    #[command(about = "send image")]
+    Image { path: String },
+    #[command(about = "send text")]
+    Text { text: String },
+    #[command(about = "quit")]
+    Quit,
+}
 
-fn main() -> Result<(), Box<dyn Error>> {
-    let args: Vec<String> = env::args().collect();
+fn main() -> Result<()> {
+    let args = CliArgs::parse();
     let (txch, rxch) = channel();
-    let run_thread = Arc::new(AtomicBool::new(true));
-    let run_proc = run_thread.clone();
-    // I saw better solution provided by  you in the course, but I leave it as is 
-    // I saw crates with better argument parsing, so next time I will use them
-    let _ = match args.len() {
-        3 => {
-            if args[1] == "-f" {
-                read_cvs_file(&args[2])?;
-                return Ok(());
-            }
-            one_shot_cmd(&args[1], args[2].clone())
-        },
-        1 => {
-            let rdhandle = thread::Builder::new()
-                .name("reader".to_string())
-                .spawn(move || reader_thr(txch));
-            let wkhandle = thread::Builder::new()
-            .name("process".to_string())
-            .spawn(move || process_thr(rxch, &run_proc)); 
-            let _ =  rdhandle.unwrap().join();
-            run_thread.store(false, Ordering::Relaxed);
-            let _ = wkhandle.unwrap().join();
-            Ok(())
-        },
+
+    match args.mode.as_str() {
+        "server" => {
+            server(&args.address, args.port)?;
+            println!("server done");
+        }
+        "client" => {
+            let _thr_handle =
+                thread::Builder::new()
+                    .name("client".to_string())
+                    .spawn(move || -> Result<()> {
+                        client(rxch, &args.address, args.port)?;
+                        Ok(())
+                    });
+            let prompt = DefaultPrompt {
+                left_prompt: DefaultPromptSegment::Basic("cmd".to_owned()),
+                ..DefaultPrompt::default()
+            };
+            let rl = ClapEditor::<Commands>::builder()
+                .with_prompt(Box::new(prompt))
+                .build();
+            rl.repl(|command| match command {
+                Commands::Filename { path } => {
+                    let data = std::fs::read(&path);
+                    if data.is_err() {
+                        eprintln!("unable to read file");
+                    } else {
+                        let message = MessageType::File {
+                            name: path,
+                            data: data.unwrap(),
+                        };
+                        let tx = txch.clone();
+                        let e = tx.send(message.clone());
+                        if e.is_err() {
+                            eprintln!("send error {:?}", e.err().unwrap())
+                        }
+                    }
+                }
+                Commands::Image { path } => {
+                    let data = std::fs::read(&path);
+                    if data.is_err() {
+                        eprintln!("unable to read file");
+                    } else {
+                        let message = MessageType::Image(data.unwrap());
+                        let tx = txch.clone();
+                        let e = tx.send(message.clone());
+                        if e.is_err() {
+                            eprintln!("send error {:?}", e.err().unwrap())
+                        }
+                    }
+                }
+                Commands::Text { text } => {
+                    let message = MessageType::Text(text);
+                    let tx = txch.clone();
+                    let e = tx.send(message.clone());
+                    if e.is_err() {
+                        eprintln!("send error {:?}", e)
+                    }
+                }
+                Commands::Quit => {
+                    println!("quit");
+                    std::process::exit(0);
+                }
+            });
+        }
         _ => {
-            usage();
-            Ok(())
-            }
+            eprintln!("unknown mode");
+            Err(anyhow::anyhow!("unknown mode"))
+        }?,
     };
     Ok(())
 }
